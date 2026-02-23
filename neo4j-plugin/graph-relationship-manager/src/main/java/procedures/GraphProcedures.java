@@ -221,9 +221,25 @@ public class GraphProcedures {
 
     private static final String Q_INC_CLEANUP_NODE_DEPS = "MATCH (n:Node {id: $nodeId})-[d:DEPENDS_ON]-() " +
         "WHERE d.dependency_type = 'node_to_node' " +
-        "WITH d, startNode(d) as n1, endNode(d) as n2 " +
+        "With d, startNode(d) as n1, endNode(d) as n2 " +
         "WHERE NOT EXISTS { MATCH (n1)<-[:RUNS_ON]-(:Application)-[:DEPENDS_ON]->(:Application)-[:RUNS_ON]->(n2) } " +
         "DELETE d";
+
+    // Aggregate version: updates node-level DEPENDS_ON for ALL nodes an app runs on in a single query
+    private static final String Q_INC_UPDATE_ALL_NODE_DEPS_FOR_APP =
+        "MATCH (app:Application {name: $appName})-[:RUNS_ON]->(thisNode:Node) " +
+        "WITH app, thisNode " +
+        "OPTIONAL MATCH (app)-[:DEPENDS_ON]->(targetApp:Application)-[:RUNS_ON]->(targetNode:Node) " +
+        "WHERE targetNode <> thisNode " +
+        "FOREACH (ignoreMe IN CASE WHEN targetNode IS NOT NULL THEN [1] ELSE [] END | " +
+        "  MERGE (thisNode)-[:DEPENDS_ON {dependency_type: 'node_to_node'}]->(targetNode) " +
+        ") " +
+        "WITH app, thisNode " +
+        "OPTIONAL MATCH (sourceApp:Application)-[:DEPENDS_ON]->(app)-[:RUNS_ON]->(sourceNode:Node) " +
+        "WHERE sourceNode <> thisNode " +
+        "FOREACH (ignoreMe IN CASE WHEN sourceNode IS NOT NULL THEN [1] ELSE [] END | " +
+        "  MERGE (sourceNode)-[:DEPENDS_ON {dependency_type: 'node_to_node'}]->(thisNode) " +
+        ")";
 
     @Context
     public GraphDatabaseService db;
@@ -236,9 +252,12 @@ public class GraphProcedures {
     @Description("CALL custom.addNodeIdOnly(id) YIELD success")
     public Stream<BooleanResult> addNodeIdOnly(@Name("id") String id) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_CREATE_NODE_ID_ONLY, Map.of("id", id)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_CREATE_NODE_ID_ONLY, Map.of("id", id))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_CONNECT_TO_ALL, Map.of("id", id));
+                tx.execute(Q_CONNECT_TO_ALL, Map.of("id", id)).close();
             }
             tx.commit();
             return Stream.of(new BooleanResult(success));
@@ -249,9 +268,12 @@ public class GraphProcedures {
     @Description("CALL custom.addNode(id, name) YIELD success")
     public Stream<BooleanResult> addNode(@Name("id") String id, @Name("name") String name) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_MERGE_NODE, Map.of("id", id, "name", name)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_MERGE_NODE, Map.of("id", id, "name", name))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_CONNECT_TO_ALL, Map.of("id", id));
+                tx.execute(Q_CONNECT_TO_ALL, Map.of("id", id)).close();
             }
             tx.commit();
             return Stream.of(new BooleanResult(success));
@@ -263,14 +285,20 @@ public class GraphProcedures {
     public Stream<BooleanResult> addTopic(@Name("id") String id, @Name("name") String name) {
         try (Transaction tx = db.beginTx()) {
             // Reject topic creation if no ALIVE Primary Broker exists (must have RUNS_ON to a Node; zombie brokers don't count)
-            boolean hasAlivePrimary = tx.execute("MATCH (b:Broker {isPrimary: true})-[:RUNS_ON]->(:Node) RETURN b LIMIT 1").hasNext();
+            boolean hasAlivePrimary;
+            try (Result r = tx.execute("MATCH (b:Broker {isPrimary: true})-[:RUNS_ON]->(:Node) RETURN b LIMIT 1")) {
+                hasAlivePrimary = r.hasNext();
+            }
             if (!hasAlivePrimary) {
                 tx.commit();
                 return Stream.of(new BooleanResult(false));
             }
-            boolean success = tx.execute(Q_CREATE_TOPIC_IF_NOT_EXISTS, Map.of("id", id, "name", name)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_CREATE_TOPIC_IF_NOT_EXISTS, Map.of("id", id, "name", name))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute("MATCH (b:Broker {isPrimary: true})-[:RUNS_ON]->(:Node), (t:Topic {id: $id}) MERGE (b)-[:ROUTES]->(t)", Map.of("id", id));
+                tx.execute("MATCH (b:Broker {isPrimary: true})-[:RUNS_ON]->(:Node), (t:Topic {id: $id}) MERGE (b)-[:ROUTES]->(t)", Map.of("id", id)).close();
             }
             tx.commit();
             return Stream.of(new BooleanResult(success));
@@ -281,24 +309,30 @@ public class GraphProcedures {
     @Description("CALL custom.addApplication(prefixedId, sanitizedName) YIELD success")
     public Stream<BooleanResult> addApplication(@Name("prefixedId") String prefixedId, @Name("sanitizedName") String sanitizedName) {
         try (Transaction tx = db.beginTx()) {
-            boolean placeholderExists = tx.execute(Q_FIND_APP, Map.of("name", prefixedId)).hasNext();
-            boolean realExists = tx.execute(Q_FIND_APP, Map.of("name", sanitizedName)).hasNext();
+            boolean placeholderExists;
+            try (Result r = tx.execute(Q_FIND_APP, Map.of("name", prefixedId))) {
+                placeholderExists = r.hasNext();
+            }
+            boolean realExists;
+            try (Result r = tx.execute(Q_FIND_APP, Map.of("name", sanitizedName))) {
+                realExists = r.hasNext();
+            }
 
             Map<String, Object> transferParams = Map.of("pName", prefixedId, "rName", sanitizedName);
             if (placeholderExists && realExists) {
                 for (String q : Q_TRANSFER_RELS) {
-                    tx.execute(q, transferParams);
+                    tx.execute(q, transferParams).close();
                 }
-                tx.execute(Q_ADD_ALIAS, transferParams);
-                tx.execute(Q_DELETE_APP, Map.of("name", prefixedId));
+                tx.execute(Q_ADD_ALIAS, transferParams).close();
+                tx.execute(Q_DELETE_APP, Map.of("name", prefixedId)).close();
                 tx.commit();
                 return Stream.of(new BooleanResult(true));
             } else if (placeholderExists) {
-                tx.execute(Q_RENAME_APP, Map.of("oldName", prefixedId, "newName", sanitizedName));
+                tx.execute(Q_RENAME_APP, Map.of("oldName", prefixedId, "newName", sanitizedName)).close();
                 tx.commit();
                 return Stream.of(new BooleanResult(true));
             } else if (!realExists) {
-                tx.execute(Q_MERGE_APP, Map.of("name", sanitizedName));
+                tx.execute(Q_MERGE_APP, Map.of("name", sanitizedName)).close();
                 tx.commit();
                 return Stream.of(new BooleanResult(true));
             }
@@ -311,19 +345,23 @@ public class GraphProcedures {
     @Description("CALL custom.removeNode(id) YIELD success, orphanedApps")
     public Stream<NodeRemoveResult> removeNode(@Name("id") String id) {
         try (Transaction tx = db.beginTx()) {
-            Result orphans = tx.execute(Q_FIND_AND_DELETE_ORPHAN_APPS, Map.of("id", id));
             List<String> orphanedApps = new ArrayList<>();
-            while (orphans.hasNext()) {
-                orphanedApps.add((String) orphans.next().get("name"));
+            try (Result orphans = tx.execute(Q_FIND_AND_DELETE_ORPHAN_APPS, Map.of("id", id))) {
+                while (orphans.hasNext()) {
+                    orphanedApps.add((String) orphans.next().get("name"));
+                }
             }
-            boolean success = tx.execute(Q_DELETE_NODE, Map.of("id", id)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_NODE, Map.of("id", id))) {
+                success = r.hasNext();
+            }
             
             // Broker cleanup: delete brokers with no Node AND no Routes.
             // A broker that still has ROUTES stays as a zombie until a new primary takes over.
-            tx.execute(Q_CHECK_AND_DELETE_USELESS_BROKERS);
+            tx.execute(Q_CHECK_AND_DELETE_USELESS_BROKERS).close();
 
             // Safety net: if no broker exists at all, orphan topics are cleaned up.
-            tx.execute(Q_CLEANUP_ORPHAN_TOPICS);
+            tx.execute(Q_CLEANUP_ORPHAN_TOPICS).close();
             
             tx.commit();
             return Stream.of(new NodeRemoveResult(success, orphanedApps));
@@ -342,26 +380,28 @@ public class GraphProcedures {
     public Stream<BooleanResult> addBroker(@Name("nodeName") String nodeName, @Name("isPrimary") Boolean isPrimary) {
         try (Transaction tx = db.beginTx()) {
             // 1. Always create broker as non-primary first
-            Result r = tx.execute(Q_ADD_BROKER, Map.of("nodeName", nodeName));
-            if (!r.hasNext()) {
-                tx.commit();
-                return Stream.of(new BooleanResult(false));
+            String newBrokerId;
+            try (Result r = tx.execute(Q_ADD_BROKER, Map.of("nodeName", nodeName))) {
+                if (!r.hasNext()) {
+                    tx.commit();
+                    return Stream.of(new BooleanResult(false));
+                }
+                newBrokerId = (String) r.next().get("brokerId");
             }
-            String newBrokerId = (String) r.next().get("brokerId");
 
             // 2. If isPrimary requested, promote this broker
             if (isPrimary != null && isPrimary) {
                 // 2a. Handover: demote old primary and transfer its routes to this broker
-                tx.execute(Q_HANDOVER_BROKERS, Map.of("newBrokerId", newBrokerId));
+                tx.execute(Q_HANDOVER_BROKERS, Map.of("newBrokerId", newBrokerId)).close();
 
                 // 2b. Promote this broker to primary
-                tx.execute(Q_PROMOTE_BROKER, Map.of("brokerId", newBrokerId));
+                tx.execute(Q_PROMOTE_BROKER, Map.of("brokerId", newBrokerId)).close();
 
                 // 2c. Route any orphan topics (not routed to any broker) to the new primary
-                tx.execute(Q_ROUTE_ALL_ORPHAN_TOPICS_TO_BROKER, Map.of("brokerId", newBrokerId));
+                tx.execute(Q_ROUTE_ALL_ORPHAN_TOPICS_TO_BROKER, Map.of("brokerId", newBrokerId)).close();
 
                 // 2d. Cleanup any brokers that were stripped of their roles and have no node
-                tx.execute(Q_CHECK_AND_DELETE_USELESS_BROKERS);
+                tx.execute(Q_CHECK_AND_DELETE_USELESS_BROKERS).close();
             }
 
             tx.commit();
@@ -373,7 +413,10 @@ public class GraphProcedures {
     @Description("CALL custom.removeTopic(id) YIELD success")
     public Stream<BooleanResult> removeTopic(@Name("id") String id) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_DELETE_TOPIC, Map.of("id", id)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_TOPIC, Map.of("id", id))) {
+                success = r.hasNext();
+            }
             tx.commit();
             return Stream.of(new BooleanResult(success));
         }
@@ -383,7 +426,10 @@ public class GraphProcedures {
     @Description("CALL custom.removeApplication(appName) YIELD success")
     public Stream<BooleanResult> removeApplication(@Name("appName") String appName) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_DELETE_APP, Map.of("name", appName)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_APP, Map.of("name", appName))) {
+                success = r.hasNext();
+            }
             tx.commit();
             return Stream.of(new BooleanResult(success));
         }
@@ -393,9 +439,12 @@ public class GraphProcedures {
     @Description("CALL custom.addRunsOn(appName, nodeId) YIELD success")
     public Stream<BooleanResult> addRunsOn(@Name("appName") String appName, @Name("nodeId") String nodeId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_CREATE_RUNS_ON_IF_NOT_EXISTS, Map.of("name", appName, "id", nodeId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_CREATE_RUNS_ON_IF_NOT_EXISTS, Map.of("name", appName, "id", nodeId))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_INC_UPDATE_NODE_DEPS, Map.of("appName", appName, "nodeId", nodeId));
+                tx.execute(Q_INC_UPDATE_NODE_DEPS, Map.of("appName", appName, "nodeId", nodeId)).close();
             }
             tx.commit();
             return Stream.of(new BooleanResult(success));
@@ -406,35 +455,40 @@ public class GraphProcedures {
     @Description("CALL custom.removeRunsOn(appName, nodeId) YIELD success, appDeleted")
     public Stream<AppRemoveResult> removeRunsOn(@Name("appName") String appName, @Name("nodeId") String nodeId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_DELETE_RUNS_ON, Map.of("name", appName, "id", nodeId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_RUNS_ON, Map.of("name", appName, "id", nodeId))) {
+                success = r.hasNext();
+            }
             if (!success) {
                 tx.commit();
                 return Stream.of(new AppRemoveResult(false, false));
             }
-            tx.execute(Q_DELETE_ORPHAN_APP_BY_NAME, Map.of("name", appName));
-            tx.execute(Q_INC_CLEANUP_NODE_DEPS, Map.of("nodeId", nodeId));
+            tx.execute(Q_DELETE_ORPHAN_APP_BY_NAME, Map.of("name", appName)).close();
+            tx.execute(Q_INC_CLEANUP_NODE_DEPS, Map.of("nodeId", nodeId)).close();
             
-            boolean appDeleted = !tx.execute(Q_FIND_APP, Map.of("name", appName)).hasNext();
+            boolean appDeleted;
+            try (Result r = tx.execute(Q_FIND_APP, Map.of("name", appName))) {
+                appDeleted = !r.hasNext();
+            }
             tx.commit();
             return Stream.of(new AppRemoveResult(true, appDeleted));
         }
     }
 
     private void triggerNodeDepUpdatesForApp(Transaction tx, String appName) {
-        Result nodes = tx.execute("MATCH (a:Application {name: $appName})-[:RUNS_ON]->(n) RETURN n.id as id", Map.of("appName", appName));
-        while (nodes.hasNext()) {
-            String nid = (String) nodes.next().get("id");
-            tx.execute(Q_INC_UPDATE_NODE_DEPS, Map.of("appName", appName, "nodeId", nid));
-        }
+        tx.execute(Q_INC_UPDATE_ALL_NODE_DEPS_FOR_APP, Map.of("appName", appName)).close();
     }
 
     @Procedure(name = "custom.addSubscribesTo", mode = Mode.WRITE)
     @Description("CALL custom.addSubscribesTo(appName, topicId) YIELD success")
     public Stream<BooleanResult> addSubscribesTo(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_CREATE_SUBSCRIBES_IF_NOT_EXISTS, Map.of("name", appName, "id", topicId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_CREATE_SUBSCRIBES_IF_NOT_EXISTS, Map.of("name", appName, "id", topicId))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_INC_UPDATE_APP_DEPS_ON_SUB, Map.of("appName", appName, "topicId", topicId));
+                tx.execute(Q_INC_UPDATE_APP_DEPS_ON_SUB, Map.of("appName", appName, "topicId", topicId)).close();
                 triggerNodeDepUpdatesForApp(tx, appName);
             }
             tx.commit();
@@ -446,9 +500,12 @@ public class GraphProcedures {
     @Description("CALL custom.removeSubscribesTo(appName, topicId) YIELD success")
     public Stream<BooleanResult> removeSubscribesTo(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_DELETE_SUBSCRIBES, Map.of("name", appName, "id", topicId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_SUBSCRIBES, Map.of("name", appName, "id", topicId))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName));
+                tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName)).close();
                 triggerNodeDepUpdatesForApp(tx, appName);
             }
             tx.commit();
@@ -460,9 +517,12 @@ public class GraphProcedures {
     @Description("CALL custom.addPublishesTo(appName, topicId) YIELD success")
     public Stream<BooleanResult> addPublishesTo(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_CREATE_PUBLISHES_IF_NOT_EXISTS, Map.of("name", appName, "id", topicId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_CREATE_PUBLISHES_IF_NOT_EXISTS, Map.of("name", appName, "id", topicId))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_INC_UPDATE_APP_DEPS_ON_PUB, Map.of("appName", appName, "topicId", topicId));
+                tx.execute(Q_INC_UPDATE_APP_DEPS_ON_PUB, Map.of("appName", appName, "topicId", topicId)).close();
                 triggerNodeDepUpdatesForApp(tx, appName);
             }
             tx.commit();
@@ -474,9 +534,12 @@ public class GraphProcedures {
     @Description("CALL custom.removePublishesTo(appName, topicId) YIELD success")
     public Stream<BooleanResult> removePublishesTo(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            boolean success = tx.execute(Q_DELETE_PUBLISHES, Map.of("name", appName, "id", topicId)).hasNext();
+            boolean success;
+            try (Result r = tx.execute(Q_DELETE_PUBLISHES, Map.of("name", appName, "id", topicId))) {
+                success = r.hasNext();
+            }
             if (success) {
-                tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName));
+                tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName)).close();
                 triggerNodeDepUpdatesForApp(tx, appName);
             }
             tx.commit();
@@ -492,7 +555,7 @@ public class GraphProcedures {
     @Description("CALL custom.updateAppDepsOnSub(appName, topicId)")
     public void updateAppDepsOnSub(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            tx.execute(Q_INC_UPDATE_APP_DEPS_ON_SUB, Map.of("appName", appName, "topicId", topicId));
+            tx.execute(Q_INC_UPDATE_APP_DEPS_ON_SUB, Map.of("appName", appName, "topicId", topicId)).close();
             tx.commit();
         }
     }
@@ -501,7 +564,7 @@ public class GraphProcedures {
     @Description("CALL custom.updateAppDepsOnPub(appName, topicId)")
     public void updateAppDepsOnPub(@Name("appName") String appName, @Name("topicId") String topicId) {
         try (Transaction tx = db.beginTx()) {
-            tx.execute(Q_INC_UPDATE_APP_DEPS_ON_PUB, Map.of("appName", appName, "topicId", topicId));
+            tx.execute(Q_INC_UPDATE_APP_DEPS_ON_PUB, Map.of("appName", appName, "topicId", topicId)).close();
             tx.commit();
         }
     }
@@ -510,7 +573,7 @@ public class GraphProcedures {
     @Description("CALL custom.updateNodeDeps(appName, nodeId)")
     public void updateNodeDeps(@Name("appName") String appName, @Name("nodeId") String nodeId) {
         try (Transaction tx = db.beginTx()) {
-            tx.execute(Q_INC_UPDATE_NODE_DEPS, Map.of("appName", appName, "nodeId", nodeId));
+            tx.execute(Q_INC_UPDATE_NODE_DEPS, Map.of("appName", appName, "nodeId", nodeId)).close();
             tx.commit();
         }
     }
@@ -519,7 +582,7 @@ public class GraphProcedures {
     @Description("CALL custom.cleanupAppDeps(appName)")
     public void cleanupAppDeps(@Name("appName") String appName) {
         try (Transaction tx = db.beginTx()) {
-            tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName));
+            tx.execute(Q_INC_CLEANUP_APP_DEPS, Map.of("appName", appName)).close();
             tx.commit();
         }
     }
@@ -528,7 +591,7 @@ public class GraphProcedures {
     @Description("CALL custom.cleanupNodeDeps(nodeId)")
     public void cleanupNodeDeps(@Name("nodeId") String nodeId) {
         try (Transaction tx = db.beginTx()) {
-            tx.execute(Q_INC_CLEANUP_NODE_DEPS, Map.of("nodeId", nodeId));
+            tx.execute(Q_INC_CLEANUP_NODE_DEPS, Map.of("nodeId", nodeId)).close();
             tx.commit();
         }
     }
